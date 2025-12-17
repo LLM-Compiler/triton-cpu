@@ -88,7 +88,9 @@ def _build(name, src, srcdir, library_dirs, include_dirs, libraries):
                     print("Info: Ignoring TRITON_LOCAL_LIBOMP_PATH for non-Apple clang compiler")
     if src.endswith(".s"):
         # This is required to properly parse .file directives
-        cc_cmd += ["-g"]
+        # Note: -g disabled due to issues with debug info from dynamic code
+        # cc_cmd += ["-g"]
+        pass
         if system == "Linux" and machine in ("aarch64", "arm64"):
             # On Arm backend, some CPU (neoverse-v2) needs to be specified through -mcpu
             cc_cmd += ["-mcpu=native"]

@@ -278,8 +278,10 @@ class CPUBackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         passes.common.add_symbol_dce(pm)
-        if os.environ.get("TRITON_DISABLE_LINE_INFO", "0") == "0":
-            passes.llvmir.add_di_scope(pm)
+        # Disable debug info for dynamically generated code from PyTorch
+        # The debug info can cause assembly errors with special characters in file paths
+        # if os.environ.get("TRITON_DISABLE_LINE_INFO", "0") == "0":
+        #     passes.llvmir.add_di_scope(pm)
         pm.run(mod)
 
         # Find kernel fn
