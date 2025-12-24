@@ -196,6 +196,8 @@ class CPUBackend(BaseBackend):
         cpu.passes.ttcpuir.add_triton_cpu_canonicalizer(pm)
         cpu.passes.ttcpuir.add_optimize_masks(pm)
         passes.common.add_canonicalizer(pm)
+        # Add Fuse Dot Bias pass
+        cpu.passes.ttcpuir.add_fuse_dot_bias_pass(pm) # Fuse Dot Bias pass # Cusotm Written Pass for fusing dot and bias operations
         if (ukernels := opt.get_ukernels()):
             # For further analysis simplification
             cpu.passes.ttcpuir.add_loop_invariant_code_motion(pm)

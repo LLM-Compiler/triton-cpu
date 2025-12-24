@@ -235,4 +235,30 @@ def TTC_BrgemmExecute : TTC_Op<"brgemm_execute",
   );
 }
 
+def TTC_DotBiasOp : TTC_Op<"dot_bias", [Pure,
+                                        DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
+  let summary = "Fused Dot Product with Bias Addition";
+  
+  // Arguments: 3 Tensors + 2 Attributes
+  let arguments = (ins
+    TTC_Vector:$a,
+    TTC_Vector:$b,
+    TTC_Vector:$bias,
+    // We keep these attributes to match TTC_DotOp behavior
+    DefaultValuedAttr<TT_InputPrecisionAttr, "::mlir::triton::InputPrecision::IEEE">:$inputPrecision,
+    DefaultValuedAttr<I32Attr, "0">:$maxNumImpreciseAcc
+  );
+
+  let results = (outs TTC_Vector:$result);
+
+  // Note: You must implement verify() in C++ to check shapes (A.k == B.k)
+  let hasVerifier = 1; 
+
+  // Assembly format allows printing with or without attributes
+  let assemblyFormat = [{
+    $a `,` $b `,` $bias (`,` `inputPrecision` `=` $inputPrecision^)? attr-dict `:`
+    type($a) `*` type($b) `+` type($bias) `->` type($result)
+  }];
+}
+
 #endif

@@ -226,6 +226,11 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   m.def("add_ub_to_llvmir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::createUBToLLVMConversionPass());
   });
+
+  // Add a new m.def entry to expose your pass
+  m.def("add_fuse_dot_bias_pass", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::cpu::createFuseDotBias());
+  });
 }
 
 void init_triton_cpu(py::module &&m) {

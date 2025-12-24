@@ -115,4 +115,22 @@ def MathToVecLib : Pass<"triton-cpu-math-to-vec-lib", "mlir::ModuleOp"> {
                              "mlir::LLVM::LLVMDialect"];
 }
 
+def DotBiasOpToLLVM : Pass<"triton-cpu-dot-bias-op-to-llvm", "mlir::ModuleOp"> {
+    let summary = "Convert TritonCPU DotBiasOp to LLVM.";
+    let description = [{
+        Lowers the fused triton_cpu.dot_bias operation into standard SCF loops 
+        and vector operations (or backend-specific intrinsics).
+    }];
+    
+    // This function must be declared in your C++ header
+    let constructor = "mlir::triton::cpu::createDotBiasOpToLLVMPass()";
+
+    let dependentDialects = ["mlir::arith::ArithDialect",
+                             "mlir::scf::SCFDialect",
+                             "mlir::memref::MemRefDialect",
+                             "mlir::LLVM::LLVMDialect",
+                             "mlir::triton::cpu::TritonCPUDialect"];
+}
+
+
 #endif

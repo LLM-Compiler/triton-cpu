@@ -10,6 +10,7 @@ add_triton_library(TritonCPUToLLVM
     MemoryOpToLLVM.cpp
     TypeConverter.cpp
     Utility.cpp
+    DotBiasOpToLLVM.cpp
 
     DEPENDS
     TritonCPUToLLVMConversionPassIncGen

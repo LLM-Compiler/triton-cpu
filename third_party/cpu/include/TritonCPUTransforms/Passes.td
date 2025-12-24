@@ -187,4 +187,18 @@ def Canonicalize : Pass<"triton-cpu-canonicalize", "mlir::ModuleOp"> {
                              "mlir::triton::cpu::TritonCPUDialect"];
 }
 
+def FuseDotBias : Pass<"triton-cpu-fuse-dot-bias", "mlir::ModuleOp"> {
+    let summary = "Fuses dot product with subsequent element-wise ops.";
+    let description = [{
+        Detects patterns like `add(dot(a, b), bias)` and replaces them with `triton_cpu.dot_bias(a, b, bias)`.
+    }];
+
+    let constructor = "mlir::triton::cpu::createFuseDotBias()";
+
+    let dependentDialects = ["mlir::arith::ArithDialect",
+                             "mlir::vector::VectorDialect",
+                             "mlir::triton::TritonDialect",
+                             "mlir::triton::cpu::TritonCPUDialect"];
+}
+
 #endif

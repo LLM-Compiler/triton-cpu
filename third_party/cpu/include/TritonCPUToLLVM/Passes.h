@@ -36,6 +36,7 @@ std::unique_ptr<OperationPass<ModuleOp>> createUkernelOpsToXSMMLLVMPass();
 std::unique_ptr<OperationPass<ModuleOp>>
 createMathToVecLibPass(VecLib lib = VecLib::Sleef,
                        std::set<std::string> cpu_features = {});
+std::unique_ptr<OperationPass<ModuleOp>> createDotBiasOpToLLVMPass();
 
 #define GEN_PASS_REGISTRATION
 #include "cpu/include/TritonCPUToLLVM/Passes.h.inc"
