@@ -31,43 +31,34 @@ Value memrefToPtr(PatternRewriter &rewriter, Location loc, Value memref) {
     return rewriter.create<triton::IntToPtrOp>(loc, ptrType, basePtrInt);
 }
 
-// Helper to create a tensor of pointers
-Value getPtrTensor(PatternRewriter &rewriter, Location loc, Value basePtr, ArrayRef<int64_t> shape, Value offsetK, int64_t packedWidth, bool isA) {
-    int64_t dim0 = shape[0];
-    int64_t dim1 = shape[1];
+// Optimization: Generate pointers for a contiguous row-major block [Rows, Cols]
+// Offset = Base + (RowIdx * Stride) + ColIdx
+Value createBlockPointers(PatternRewriter &rewriter, Location loc, Value basePtr, ArrayRef<int64_t> shape, int64_t stride) {
+    int64_t rows = shape[0];
+    int64_t cols = shape[1];
     
-    // Create ranges
-    Value range0 = rewriter.create<triton::MakeRangeOp>(loc, RankedTensorType::get({dim0}, rewriter.getI32Type()), 0, dim0);
-    Value range1 = rewriter.create<triton::MakeRangeOp>(loc, RankedTensorType::get({dim1}, rewriter.getI32Type()), 0, dim1);
+    // 1. Create Range(0, Rows) and Range(0, Cols)
+    Value rangeRows = rewriter.create<triton::MakeRangeOp>(loc, RankedTensorType::get({rows}, rewriter.getI32Type()), 0, rows);
+    Value rangeCols = rewriter.create<triton::MakeRangeOp>(loc, RankedTensorType::get({cols}, rewriter.getI32Type()), 0, cols);
     
-    // Broadcast
-    Value range0Bc = rewriter.create<triton::ExpandDimsOp>(loc, range0, 1);
-    range0Bc = rewriter.create<triton::BroadcastOp>(loc, RankedTensorType::get({dim0, dim1}, rewriter.getI32Type()), range0Bc);
+    // 2. Expand and Broadcast to [Rows, Cols]
+    Value rows2D = rewriter.create<triton::ExpandDimsOp>(loc, rangeRows, 1);
+    rows2D = rewriter.create<triton::BroadcastOp>(loc, RankedTensorType::get({rows, cols}, rewriter.getI32Type()), rows2D);
     
-    Value range1Bc = rewriter.create<triton::ExpandDimsOp>(loc, range1, 0);
-    range1Bc = rewriter.create<triton::BroadcastOp>(loc, RankedTensorType::get({dim0, dim1}, rewriter.getI32Type()), range1Bc);
+    Value cols2D = rewriter.create<triton::ExpandDimsOp>(loc, rangeCols, 0);
+    cols2D = rewriter.create<triton::BroadcastOp>(loc, RankedTensorType::get({rows, cols}, rewriter.getI32Type()), cols2D);
     
-    Value cPackedWidth = rewriter.create<arith::ConstantIntOp>(loc, packedWidth, 32);
-    Value splatPackedWidth = rewriter.create<triton::SplatOp>(loc, RankedTensorType::get({dim0, dim1}, rewriter.getI32Type()), cPackedWidth);
+    // 3. Calculate Linear Offsets: (Row * Stride) + Col
+    Value cStride = rewriter.create<arith::ConstantIntOp>(loc, stride, 32);
+    Value strideSplat = rewriter.create<triton::SplatOp>(loc, RankedTensorType::get({rows, cols}, rewriter.getI32Type()), cStride);
     
-    Value offsetK_i32 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), offsetK);
-    Value splatOffsetK = rewriter.create<triton::SplatOp>(loc, RankedTensorType::get({dim0, dim1}, rewriter.getI32Type()), offsetK_i32);
+    Value rowOffset = rewriter.create<arith::MulIOp>(loc, rows2D, strideSplat);
+    Value totalOffset = rewriter.create<arith::AddIOp>(loc, rowOffset, cols2D);
     
-    Value linearOffset;
-    if (isA) {
-        // i * packedWidth + j + offsetK
-        Value term0 = rewriter.create<arith::MulIOp>(loc, range0Bc, splatPackedWidth);
-        Value term1 = rewriter.create<arith::AddIOp>(loc, term0, range1Bc);
-        linearOffset = rewriter.create<arith::AddIOp>(loc, term1, splatOffsetK);
-    } else {
-        // (i + offsetK) * packedWidth + j
-        Value iPlusOffset = rewriter.create<arith::AddIOp>(loc, range0Bc, splatOffsetK);
-        Value term0 = rewriter.create<arith::MulIOp>(loc, iPlusOffset, splatPackedWidth);
-        linearOffset = rewriter.create<arith::AddIOp>(loc, term0, range1Bc);
-    }
+    // 4. Add to Base Pointer
+    Value baseSplat = rewriter.create<triton::SplatOp>(loc, RankedTensorType::get({rows, cols}, basePtr.getType()), basePtr);
     
-    Value splatBase = rewriter.create<triton::SplatOp>(loc, RankedTensorType::get({dim0, dim1}, basePtr.getType()), basePtr);
-    return rewriter.create<triton::AddPtrOp>(loc, splatBase.getType(), splatBase, linearOffset);
+    return rewriter.create<triton::AddPtrOp>(loc, baseSplat.getType(), baseSplat, totalOffset);
 }
 
 // Helper to store a tensor to a memref (pointer)
@@ -80,7 +71,37 @@ void storeTensorToMemRef(PatternRewriter &rewriter, Location loc, Value tensor, 
     int64_t packedWidth = memRefType.getShape()[1];
     
     Value basePtr = memrefToPtr(rewriter, loc, memref);
-    Value ptrs = getPtrTensor(rewriter, loc, basePtr, shape, offsetK, packedWidth, isA);
+    
+    // Calculate Base Offset
+    Value ptrOffset;
+    if (isA) {
+        // For A (MxK), we are storing a block at offsetK in the K dimension (dim 1).
+        // Base Offset = offsetK
+        // offsetK is likely i32 or index, cast to i64 for pointer arithmetic
+        if (offsetK.getType().isIndex()) {
+             ptrOffset = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), offsetK);
+        } else {
+             ptrOffset = rewriter.create<arith::ExtSIOp>(loc, rewriter.getI64Type(), offsetK);
+        }
+    } else {
+        // For B (KxN), we are storing a block at offsetK in the K dimension (dim 0).
+        // Base Offset = offsetK * packedWidth (Stride)
+        Value offsetK_i64;
+        if (offsetK.getType().isIndex()) {
+             offsetK_i64 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), offsetK);
+        } else {
+             offsetK_i64 = rewriter.create<arith::ExtSIOp>(loc, rewriter.getI64Type(), offsetK);
+        }
+        Value width_i64 = rewriter.create<arith::ConstantIntOp>(loc, packedWidth, 64);
+        ptrOffset = rewriter.create<arith::MulIOp>(loc, offsetK_i64, width_i64);
+    }
+    
+    // Adjust Base Pointer
+    Type ptrType = basePtr.getType();
+    Value offsetPtr = rewriter.create<triton::AddPtrOp>(loc, ptrType, basePtr, ptrOffset);
+
+    // Generate Pointers
+    Value ptrs = createBlockPointers(rewriter, loc, offsetPtr, shape, packedWidth);
     
     rewriter.create<triton::StoreOp>(loc, ptrs, tensor, triton::CacheModifier::NONE, triton::EvictionPolicy::NORMAL);
 }
@@ -94,7 +115,33 @@ Value loadTensorFromMemRef(PatternRewriter &rewriter, Location loc, Value memref
     int64_t packedWidth = memRefType.getShape()[1];
     
     Value basePtr = memrefToPtr(rewriter, loc, memref);
-    Value ptrs = getPtrTensor(rewriter, loc, basePtr, shape, offsetK, packedWidth, isA);
+    
+    // Calculate Base Offset
+    Value ptrOffset;
+    if (isA) {
+        // offsetK is likely i32 or index, cast to i64 for pointer arithmetic
+        if (offsetK.getType().isIndex()) {
+             ptrOffset = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), offsetK);
+        } else {
+             ptrOffset = rewriter.create<arith::ExtSIOp>(loc, rewriter.getI64Type(), offsetK);
+        }
+    } else {
+        Value offsetK_i64;
+        if (offsetK.getType().isIndex()) {
+             offsetK_i64 = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), offsetK);
+        } else {
+             offsetK_i64 = rewriter.create<arith::ExtSIOp>(loc, rewriter.getI64Type(), offsetK);
+        }
+        Value width_i64 = rewriter.create<arith::ConstantIntOp>(loc, packedWidth, 64);
+        ptrOffset = rewriter.create<arith::MulIOp>(loc, offsetK_i64, width_i64);
+    }
+    
+    // Adjust Base Pointer
+    Type ptrType = basePtr.getType();
+    Value offsetPtr = rewriter.create<triton::AddPtrOp>(loc, ptrType, basePtr, ptrOffset);
+
+    // Generate Pointers
+    Value ptrs = createBlockPointers(rewriter, loc, offsetPtr, shape, packedWidth);
     
     return rewriter.create<triton::LoadOp>(loc, ptrs, triton::CacheModifier::NONE, triton::EvictionPolicy::NORMAL, false);
 }
