@@ -54,7 +54,8 @@ def _build(name, src, srcdir, library_dirs, include_dirs, libraries):
     custom_backend_dirs = set(os.getenv(var) for var in ('TRITON_CUDACRT_PATH', 'TRITON_CUDART_PATH'))
     include_dirs = include_dirs + [srcdir, py_include_dir, *custom_backend_dirs]
     # for -Wno-psabi, see https://gcc.gnu.org/bugzilla/show_bug.cgi?id=111047
-    cc_cmd = [cc, src, "-O3", "-shared", "-fPIC", "-Wno-psabi", "-o", so]
+    #cc_cmd = [cc, src, "-O3", "-shared", "-fPIC", "-Wno-psabi", "-g", "-fno-omit-frame-pointer", "-o", so]
+    cc_cmd = [cc, src, "-O3", "-shared", "-fPIC", "-Wno-psabi", "-g", "-o", so]
 
     libraries += ["gcc"]
     # Use dynamic lookup to load Python library on Mac
