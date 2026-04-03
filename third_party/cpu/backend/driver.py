@@ -152,9 +152,10 @@ def make_launcher(constants, signature, ids):
             "uint64_t": "K",
         }[ty_to_cpp(ty)]
 
-    # Filter out constexpr from args_format since they're not passed at runtime
-    args_format = ''.join([format_of(ty) for ty in signature.values() if ty != "constexpr"])
-    format = "iiiOKOOOO" + args_format
+    args_format_full = ''.join([format_of(ty) for ty in signature.values()])
+    args_format_without_constexpr = ''.join([format_of(ty) for ty in signature.values() if ty != "constexpr"])
+    format_full = "iiiOKOOOO" + args_format_full
+    format_without_constexpr = "iiiOKOOOO" + args_format_without_constexpr
 
     signature = ','.join(map(_serialize_signature, signature.values()))
     signature = list(filter(bool, signature.split(',')))
@@ -162,10 +163,12 @@ def make_launcher(constants, signature, ids):
 
     arg_decls = ', '.join(f"{ty_to_cpp(ty)} arg{i}" for i, ty in signature.items() if ty != "constexpr")
 
-    # arg_ptrs_list must match arg_decls - only include non-constexpr args
-    signature_without_constexprs = {i: ty for i, ty in signature.items() if ty != "constexpr"}
-    arg_ptrs_list = ', '.join(f"&arg{i}" for i in signature_without_constexprs.keys())
+    arg_ptrs_list_full = ', '.join(f"&arg{i}" for i in signature.keys())
+    arg_ptrs_list_without_constexpr = ', '.join(f"&arg{i}" for i, ty in signature.items() if ty != "constexpr")
     kernel_fn_args = [i for i, ty in signature.items() if i not in constants and ty != "constexpr"]
+    signature_without_constexprs = {i: ty for i, ty in signature.items() if ty != "constexpr"}
+    num_signature_full = len(signature)
+    num_signature_without_constexpr = len(signature_without_constexprs)
     kernel_fn_args_list = ', '.join(f"arg{i}" for i in kernel_fn_args)
     kernel_fn_arg_types = ', '.join([f"{ty_to_cpp(signature[i])}" for i in kernel_fn_args] + ["uint32_t"] * 6)
 
@@ -309,9 +312,34 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   void* pKrnl;
 
   {' '.join([f"{_extracted_type(ty)} arg{i}; " for i, ty in signature.items()])}
-  if(!PyArg_ParseTuple(args, \"{format}\", &gridX, &gridY, &gridZ, &py_obj_stream, &pKrnl,
-                                       &kernel_metadata, &launch_metadata,
-                                       &launch_enter_hook, &launch_exit_hook {', ' + arg_ptrs_list if len(signature) > 0 else ''})) {{
+  const Py_ssize_t nargs = PyTuple_GET_SIZE(args);
+  const Py_ssize_t expected_with_constexpr = 9 + {num_signature_full};
+  const Py_ssize_t expected_without_constexpr = 9 + {num_signature_without_constexpr};
+  if (expected_with_constexpr == expected_without_constexpr) {{
+    if(!PyArg_ParseTuple(args, \"{format_full}\", &gridX, &gridY, &gridZ, &py_obj_stream, &pKrnl,
+                                         &kernel_metadata, &launch_metadata,
+                                         &launch_enter_hook, &launch_exit_hook {', ' + arg_ptrs_list_full if len(signature) > 0 else ''})) {{
+      return NULL;
+    }}
+  }} else if (nargs == expected_without_constexpr) {{
+    if(!PyArg_ParseTuple(args, \"{format_without_constexpr}\", &gridX, &gridY, &gridZ, &py_obj_stream, &pKrnl,
+                                         &kernel_metadata, &launch_metadata,
+                                         &launch_enter_hook, &launch_exit_hook {', ' + arg_ptrs_list_without_constexpr if len(signature_without_constexprs) > 0 else ''})) {{
+      return NULL;
+    }}
+  }} else if (nargs == expected_with_constexpr) {{
+    if(!PyArg_ParseTuple(args, \"{format_full}\", &gridX, &gridY, &gridZ, &py_obj_stream, &pKrnl,
+                                         &kernel_metadata, &launch_metadata,
+                                         &launch_enter_hook, &launch_exit_hook {', ' + arg_ptrs_list_full if len(signature) > 0 else ''})) {{
+      return NULL;
+    }}
+  }} else {{
+    PyErr_Format(
+        PyExc_TypeError,
+        "launch: expected %zd (without constexpr) or %zd (with constexpr) arguments, got %zd",
+        expected_without_constexpr,
+        expected_with_constexpr,
+        nargs);
     return NULL;
   }}
 
