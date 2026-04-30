@@ -186,24 +186,32 @@ def make_launcher(constants, signature, ids):
     # generate glue code
     src = f"""
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #ifdef _OPENMP
 #include <omp.h>
 #endif // _OPENMP
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdio.h>
 #include <string>
 #include <thread>
-#include <memory>
 #include <vector>
 #ifdef __linux__
+// #include <cerrno>
+// #include <sys/syscall.h>
+// #include <unistd.h>
+// #include <linux/mempolicy.h>
 #include <pthread.h>
 #include <sched.h>
 #endif // __linux__
@@ -348,6 +356,206 @@ static void bind_current_thread_to_cpu(int cpu_id) {{
   (void)cpu_id;
 #endif // __linux__
 }}
+
+// static int query_numa_node_for_ptr(void* addr) {{
+// #ifdef __linux__
+//   if (addr == nullptr) {{
+//     return -1;
+//   }}
+//   int node = -1;
+//   long rc = syscall(
+//       SYS_get_mempolicy,
+//       &node,
+//       nullptr,
+//       0,
+//       addr,
+//       MPOL_F_NODE | MPOL_F_ADDR);
+//   if (rc != 0) {{
+//     return -2;
+//   }}
+//   return node;
+// #else
+//   (void)addr;
+//   return -3;
+// #endif // __linux__
+// }}
+
+// -------------------------------------------------------------------------
+// Persistent NUMA-pinned thread pool.
+//
+// Replaces the fresh-std::thread-per-kernel-launch path (which calls
+// pthread_setaffinity_np on every launch) with a pool that is created once,
+// pins each worker to a specific CPU at construction, and parks workers on
+// a per-node condvar between launches. Each Triton-CPU launcher module owns
+// its own pool (process-scoped singleton here), initialized lazily from the
+// first launch's ``numa_nodes`` list.
+//
+// Dispatch model: caller provides a callable invoked on each worker with
+// ``(node_i, local_tid, node_threads)``. The callable is responsible for
+// computing its grid slice and invoking the kernel. ``dispatch_and_wait``
+// blocks until all workers of all nodes have finished, matching the
+// prior join-on-every-launch semantics so locals captured by reference on
+// the caller's stack remain valid.
+//
+// The pool ignores the per-launch ``num_threads`` argument: it always uses
+// all CPUs listed in each socket's cpulist. For the NUMA path this matches
+// intent (the whole point of pinning is to use all cores of each socket).
+// If the pool fails to init (empty cpulist / exception), the caller falls
+// back to ``run_omp_kernels`` for this launch.
+// -------------------------------------------------------------------------
+namespace {{
+
+struct NumaPoolNode {{
+  std::mutex mu;
+  std::condition_variable cv;
+  uint64_t epoch{{0}};
+  bool shutdown{{false}};
+  int node_threads{{0}};
+  std::function<void(int /*local_tid*/, int /*node_threads*/)> task;
+}};
+
+class NumaThreadPool {{
+ public:
+  // ``numa_nodes`` lists the NUMA node ids in shard order (index 0 = shard 0,
+  // etc.). For each node we read its cpulist and spawn one pinned worker per
+  // CPU. Returns false on init failure.
+  bool init(const std::vector<int>& numa_nodes) {{
+    nodes_.reserve(numa_nodes.size());
+    for (size_t ni = 0; ni < numa_nodes.size(); ++ni) {{
+      nodes_.emplace_back(std::unique_ptr<NumaPoolNode>(new NumaPoolNode()));
+    }}
+    int total = 0;
+    for (size_t ni = 0; ni < numa_nodes.size(); ++ni) {{
+      std::vector<int> cpus = get_numa_node_cpus(numa_nodes[(size_t)ni]);
+      int nt = (int)cpus.size();
+      if (nt <= 0) {{
+        // No cpulist available: park one unpinned worker for this node so
+        // subsequent dispatches still make progress on this shard.
+        nt = 1;
+        cpus.assign(1, -1);
+      }}
+      nodes_[ni]->node_threads = nt;
+      for (int tid = 0; tid < nt; ++tid) {{
+        int cpu = cpus[(size_t)tid];
+        NumaPoolNode* np = nodes_[ni].get();
+        workers_.emplace_back(std::thread([this, np, tid, nt, cpu]() {{
+          bind_current_thread_to_cpu(cpu);
+          uint64_t seen = 0;
+          while (true) {{
+            std::function<void(int, int)> fn;
+            {{
+              std::unique_lock<std::mutex> lk(np->mu);
+              np->cv.wait(lk, [&]{{ return np->shutdown || np->epoch > seen; }});
+              if (np->shutdown) {{
+                return;
+              }}
+              seen = np->epoch;
+              fn = np->task;
+            }}
+            if (fn) {{
+              try {{
+                fn(tid, nt);
+              }} catch (...) {{
+                // Swallow exceptions from the kernel callable so a single
+                // errant task cannot take down the pool.
+              }}
+            }}
+            int before = remaining_.fetch_sub(1, std::memory_order_acq_rel);
+            if (before == 1) {{
+              std::lock_guard<std::mutex> dlk(done_mu_);
+              done_cv_.notify_one();
+            }}
+          }}
+        }}));
+        ++total;
+      }}
+    }}
+    return total > 0;
+  }}
+
+  size_t num_nodes() const {{ return nodes_.size(); }}
+
+  int node_threads(size_t ni) const {{
+    return (ni < nodes_.size()) ? nodes_[ni]->node_threads : 0;
+  }}
+
+  // Dispatch ``per_worker_fn(node_i, local_tid, node_threads)`` to every
+  // worker of every node and block until all have finished.
+  void dispatch_and_wait(
+      const std::function<void(int, int, int)>& per_worker_fn) {{
+    int total = 0;
+    for (auto& n : nodes_) total += n->node_threads;
+    if (total <= 0) return;
+    remaining_.store(total, std::memory_order_release);
+    for (size_t ni = 0; ni < nodes_.size(); ++ni) {{
+      NumaPoolNode* np = nodes_[ni].get();
+      int node_i = (int)ni;
+      {{
+        std::lock_guard<std::mutex> lk(np->mu);
+        np->task = [per_worker_fn, node_i](int tid, int nt) {{
+          per_worker_fn(node_i, tid, nt);
+        }};
+        np->epoch += 1;
+      }}
+      np->cv.notify_all();
+    }}
+    std::unique_lock<std::mutex> dlk(done_mu_);
+    done_cv_.wait(dlk, [&]{{ return remaining_.load(std::memory_order_acquire) == 0; }});
+  }}
+
+  ~NumaThreadPool() {{
+    for (auto& np : nodes_) {{
+      {{
+        std::lock_guard<std::mutex> lk(np->mu);
+        np->shutdown = true;
+      }}
+      np->cv.notify_all();
+    }}
+    for (auto& w : workers_) {{
+      if (w.joinable()) w.join();
+    }}
+  }}
+
+ private:
+  std::vector<std::unique_ptr<NumaPoolNode>> nodes_;
+  std::vector<std::thread> workers_;
+  std::atomic<int> remaining_{{0}};
+  std::mutex done_mu_;
+  std::condition_variable done_cv_;
+}};
+
+static std::unique_ptr<NumaThreadPool> g_numa_pool;
+static std::mutex g_numa_pool_mu;
+static std::vector<int> g_numa_pool_nodes;
+
+// Returns a process-lifetime NumaThreadPool initialized on first call.
+// On subsequent calls the pool is reused only if ``numa_nodes`` matches the
+// one it was initialized with (same topology). On any mismatch or init
+// failure, returns nullptr and the caller falls back to the spawn path.
+static NumaThreadPool* get_or_init_numa_pool(const std::vector<int>& numa_nodes) {{
+  std::lock_guard<std::mutex> lk(g_numa_pool_mu);
+  if (g_numa_pool) {{
+    if (g_numa_pool_nodes == numa_nodes) {{
+      return g_numa_pool.get();
+    }}
+    return nullptr;
+  }}
+  std::unique_ptr<NumaThreadPool> pool(new NumaThreadPool());
+  bool ok = false;
+  try {{
+    ok = pool->init(numa_nodes);
+  }} catch (...) {{
+    ok = false;
+  }}
+  if (!ok) {{
+    return nullptr;
+  }}
+  g_numa_pool = std::move(pool);
+  g_numa_pool_nodes = numa_nodes;
+  return g_numa_pool.get();
+}}
+
+}}  // namespace
 
 static void run_omp_kernels(uint32_t gridX, uint32_t gridY, uint32_t gridZ, int num_threads, kernel_ptr_t kernel_ptr {(', ' + arg_decls) if len(arg_decls) > 0 else ''}) {{
   // TODO: Consider using omp collapse(3) clause for simplicity?
@@ -517,44 +725,67 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
           const size_t N = (size_t)gridX * (size_t)gridY * (size_t)gridZ;
           auto all_grids = get_all_grids(gridX, gridY, gridZ);
 
-          int hw_threads = (int)std::thread::hardware_concurrency();
-          if (hw_threads <= 0) {{
-            hw_threads = 1;
-          }}
-          int total_threads = (num_threads > 0) ? num_threads : hw_threads;
-          if (total_threads < (int)numa_count) {{
-            total_threads = (int)numa_count;
-          }}
+          // Try the persistent pinned pool first. On first call, the pool
+          // spawns one worker per CPU per NUMA node (pinned once) and keeps
+          // them parked on a condvar between launches. On subsequent calls
+          // this saves (std::thread construction + pthread_setaffinity_np +
+          // join) × total_threads on every kernel launch.
+          NumaThreadPool* pool = get_or_init_numa_pool(numa_nodes);
+          if (pool != nullptr) {{
+            pool->dispatch_and_wait(
+                [&](int node_i, int local_tid, int node_threads) {{
+                  size_t start = (N * (size_t)local_tid) / (size_t)node_threads;
+                  size_t end = (N * (size_t)(local_tid + 1)) / (size_t)node_threads;
+                  const std::vector<void*>& numa_ptrs = per_node_ptrs[(size_t)node_i];
+                  for (size_t i = start; i < end; ++i) {{
+                    const auto [x, y, z] = all_grids[i];
+                    (*kernel_ptr)({kernel_launch_args_numa + ', ' if len(signature_without_constexprs) > 0 else ''}x, y, z, gridX, gridY, gridZ);
+                  }}
+                }});
+            launched_numa = true;
+          }} else {{
+            // Pool init failed (e.g. empty cpulists, topology mismatch).
+            // Fall back to the spawn-per-launch path so NUMA work still gets
+            // dispatched — just without the pooling speedup.
+            int hw_threads = (int)std::thread::hardware_concurrency();
+            if (hw_threads <= 0) {{
+              hw_threads = 1;
+            }}
+            int total_threads = (num_threads > 0) ? num_threads : hw_threads;
+            if (total_threads < (int)numa_count) {{
+              total_threads = (int)numa_count;
+            }}
 
-          std::vector<std::thread> workers;
-          workers.reserve((size_t)total_threads);
-          int base_threads = total_threads / (int)numa_count;
-          int rem_threads = total_threads % (int)numa_count;
-          for (Py_ssize_t node_i = 0; node_i < numa_count; ++node_i) {{
-            int node_threads = base_threads + ((node_i < rem_threads) ? 1 : 0);
-            if (node_threads <= 0) {{
-              continue;
+            std::vector<std::thread> workers;
+            workers.reserve((size_t)total_threads);
+            int base_threads = total_threads / (int)numa_count;
+            int rem_threads = total_threads % (int)numa_count;
+            for (Py_ssize_t node_i = 0; node_i < numa_count; ++node_i) {{
+              int node_threads = base_threads + ((node_i < rem_threads) ? 1 : 0);
+              if (node_threads <= 0) {{
+                continue;
+              }}
+              std::vector<int> node_cpus = get_numa_node_cpus(numa_nodes[(size_t)node_i]);
+              for (int local_tid = 0; local_tid < node_threads; ++local_tid) {{
+                workers.emplace_back([&, node_i, local_tid, node_threads, node_cpus]() {{
+                  if (!node_cpus.empty()) {{
+                    bind_current_thread_to_cpu(node_cpus[(size_t)local_tid % node_cpus.size()]);
+                  }}
+                  size_t start = (N * (size_t)local_tid) / (size_t)node_threads;
+                  size_t end = (N * (size_t)(local_tid + 1)) / (size_t)node_threads;
+                  const std::vector<void*>& numa_ptrs = per_node_ptrs[(size_t)node_i];
+                  for (size_t i = start; i < end; ++i) {{
+                    const auto [x, y, z] = all_grids[i];
+                    (*kernel_ptr)({kernel_launch_args_numa + ', ' if len(signature_without_constexprs) > 0 else ''}x, y, z, gridX, gridY, gridZ);
+                  }}
+                }});
+              }}
             }}
-            std::vector<int> node_cpus = get_numa_node_cpus(numa_nodes[(size_t)node_i]);
-            for (int local_tid = 0; local_tid < node_threads; ++local_tid) {{
-              workers.emplace_back([&, node_i, local_tid, node_threads, node_cpus]() {{
-                if (!node_cpus.empty()) {{
-                  bind_current_thread_to_cpu(node_cpus[(size_t)local_tid % node_cpus.size()]);
-                }}
-                size_t start = (N * (size_t)local_tid) / (size_t)node_threads;
-                size_t end = (N * (size_t)(local_tid + 1)) / (size_t)node_threads;
-                const std::vector<void*>& numa_ptrs = per_node_ptrs[(size_t)node_i];
-                for (size_t i = start; i < end; ++i) {{
-                  const auto [x, y, z] = all_grids[i];
-                  (*kernel_ptr)({kernel_launch_args_numa + ', ' if len(signature_without_constexprs) > 0 else ''}x, y, z, gridX, gridY, gridZ);
-                }}
-              }});
+            for (auto& worker : workers) {{
+              worker.join();
             }}
+            launched_numa = true;
           }}
-          for (auto& worker : workers) {{
-            worker.join();
-          }}
-          launched_numa = true;
         }}
       }}
     }}
