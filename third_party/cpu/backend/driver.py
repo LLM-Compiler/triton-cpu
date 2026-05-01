@@ -72,14 +72,29 @@ class CPUUtils(object):
         pass
 
     def load_binary(self, name, kernel, shared_mem, device):
-        with tempfile.NamedTemporaryFile(mode="wb", suffix=".so") as f:
-            f.write(kernel)
-            f.flush()
-            import ctypes
-            lib = ctypes.cdll.LoadLibrary(f.name)
-            fn_ptr = getattr(lib, name)
-            fn_ptr_as_void_p = ctypes.cast(fn_ptr, ctypes.c_void_p).value
-            return (lib, fn_ptr_as_void_p, 0, 0)
+        # Persist kernel .so files at deterministic, hash-named paths so external
+        # profilers (Intel Advisor, VTune, perf) can resolve symbols and source
+        # locations after the Python process exits.  NamedTemporaryFile's default
+        # delete=True unlinks the file the moment this method returns, leaving
+        # Pin / Advisor with "Cannot locate file" errors and zero FLOP
+        # attribution → empty roofline.
+        dump_dir = os.environ.get(
+            "TRITON_KERNEL_DUMP_DIR",
+            os.path.join(tempfile.gettempdir(), "triton_cpu_kernels"),
+        )
+        os.makedirs(dump_dir, exist_ok=True)
+        kernel_hash = hashlib.md5(kernel).hexdigest()
+        so_path = os.path.join(dump_dir, f"{name}_{kernel_hash}.so")
+        if not os.path.exists(so_path):
+            tmp_path = so_path + ".tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(kernel)
+            os.replace(tmp_path, so_path)
+        import ctypes
+        lib = ctypes.cdll.LoadLibrary(so_path)
+        fn_ptr = getattr(lib, name)
+        fn_ptr_as_void_p = ctypes.cast(fn_ptr, ctypes.c_void_p).value
+        return (lib, fn_ptr_as_void_p, 0, 0)
 
     def get_device_properties(self, *args):
         return {"max_shared_mem": 0}
